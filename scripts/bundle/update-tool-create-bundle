@@ -1,0 +1,233 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+
+# This generates an update bundle conatining the images, a manifest with the
+# SHA256 sums of each image. The bundle can then be given as parameter to the update-tool.
+#
+# There shall be at least one image given which will be part of the bundle.
+# The single image parameters this script gets called with, must match with
+# the set number. If a set shall be skipped, because the image will not be
+# part of the bundle, its parameter shall be set to '-'.
+#
+# Examples:
+#  To update set bootloader and bootfs, you might call the tool with:
+#
+#    update-tool-create-bundle.sh bootloader:/<PATH>/bootloader bootfs:/<PATH>/fit.img
+
+SCRIPT_VERSION="0.1"
+SCRIPT_NAME=$(basename "$0")
+
+SCRIPT_USAGE=$(cat <<EOF
+Usage: ${SCRIPT_NAME} [-hvrzcsSm] [<set_name>:<image_path>..]
+
+Generates an update bundle containing all given images and a manifest file
+describing the contained images and providing checksums for all images.
+
+Example:
+    ${SCRIPT_NAME} --allow-rollback -z --sha256 -c bootfs:fit.img rootfs:../root.img
+
+-h|--help:
+    Displays this help.
+--version:
+    Displays the current version of this script.
+-v|--verbose:
+    Display additional information.
+-r|--allow-rollback:
+    Whether or not a rollback to an older system is allowed.
+-z|--zipped
+    Zip the resulting update bundle.
+-c|--cleanup:
+    Remove the temporary files.
+-s|--sha256:
+    Generate SHA256 checksums for each image. (Default)
+-S|--sha1:
+    Generate SHA1 checksums for all images.
+-m|--md5:
+    Generate MD5 checksums for all images.
+EOF
+)
+
+# Helper functions.
+error() {
+    printf "Error: %s\n" "$@" 1>&2
+}
+
+info() {
+    if [ ${VERBOSE_INFO} -ne 0 ]; then
+        echo "$@"
+    fi
+}
+
+usage() {
+    rc=0
+
+    if [ -n "${1}" ]; then
+        rc="${1}"
+    fi
+
+    if [ -n "${2}" ]; then
+        error "${2}"
+    fi
+
+    echo "${SCRIPT_USAGE}"
+
+    exit "${rc}"
+}
+
+absolute_path() {
+    cd "$(dirname "${1}")" || exit
+    case $(basename "${1}") in
+        ..) dirname "$(pwd)";;
+        .)  pwd;;
+        *)  echo "$(pwd)/$(basename "${1}")";;
+    esac
+}
+
+CHECKSUM_CMD=""
+VERBOSE_INFO=0
+ROLLBACK=0
+CLEANUP=0
+ZIPPED=0
+
+while [ -n "${1+xxx}" ]; do
+    case "${1}" in
+        --help|-h)
+            usage
+            ;;
+        --version)
+            echo "${SCRIPT_NAME} v${SCRIPT_VERSION}"
+            exit 0
+            ;;
+        --verbose|-v)
+            VERBOSE_INFO=1
+            ;;
+        -r|--allow-rollback)
+            ROLLBACK=1
+            ;;
+        -z|--zipped)
+            ZIPPED=1
+            ;;
+        -c|--cleanup)
+            CLEANUP=1
+            ;;
+        --sha256|-s)
+            if [ -n "${CHECKSUM_CMD}" ]; then
+                usage 1 "Cannot use more than one checksum type."
+            fi
+
+            CHECKSUM_CMD="sha256sum"
+            ;;
+        --sha1|-S)
+            if [ -n "${CHECKSUM_CMD}" ]; then
+                usage 1 "Cannot use more than one checksum type."
+            fi
+
+            CHECKSUM_CMD="sha1sum"
+            ;;
+        --md5|-m)
+            if [ -n "${CHECKSUM_CMD}" ]; then
+                usage 1 "Cannot use more than one checksum type."
+            fi
+
+            CHECKSUM_CMD="md5sum"
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            usage 1 "Unrecognized option ${1}."
+            ;;
+        *)
+            break
+            ;;
+    esac
+
+    shift
+done
+
+if [ -z "${CHECKSUM_CMD}" ]; then
+    CHECKSUM_CMD="sha256sum"
+fi
+
+# Ensure at least one image name is given.
+if [ $# -lt 1 ]; then
+    usage 1 "Invalid number of arguments."
+fi
+
+IMAGES=""
+CHECKSUM_TYPE="${CHECKSUM_CMD%"sum"}"
+
+cat <<'EOF' > Manifest.json
+{
+    "version": "3",
+EOF
+
+if [ "${ROLLBACK}" -eq 1 ]; then
+    printf "    \"rollback-allowed\": true,\n" >> Manifest.json
+else
+    printf "    \"rollback-allowed\": false,\n" >> Manifest.json
+fi
+
+
+printf "    \"images\": [\n" >> Manifest.json
+
+while [ -n "${1+xxx}" ]; do
+    IFS=':' read -r SET_NAME IMAGE_FILE  < <(echo "${1}")
+    if [ -z "${SET_NAME}" ] || [ -z "${IMAGE_FILE}" ]; then
+        usage 1 "'${1}' is not a valid image description. Should be \"<set_name>:<image_file>\"."
+    fi
+
+    IMAGE_PATH="$(absolute_path "${IMAGE_FILE}")"
+    if ! [ -f "${IMAGE_PATH}" ]; then
+        usage 1 "Image ${IMAGE_PATH} does not exist"
+    fi
+
+    info "Calculating ${CHECKSUM_TYPE} of ${IMAGE_FILE}"
+    CHECKSUM=$("${CHECKSUM_CMD}" "${IMAGE_PATH}" | cut -d ' ' -f 1)
+
+    if [ -n "${IMAGES}" ]; then
+        printf "%s,\n" "$(< Manifest.json)" > Manifest.json
+    fi
+
+cat <<EOF >> Manifest.json
+        {
+            "name": "${SET_NAME}",
+            "filename": "$(basename "${IMAGE_FILE}")",
+            "${CHECKSUM_TYPE}": "${CHECKSUM}"
+        }
+EOF
+
+    IMAGES="${IMAGES} -C $(dirname "${IMAGE_PATH}") $(basename "${IMAGE_PATH}")"
+
+    shift
+done
+
+printf "    ]\n}\n" >> Manifest.json
+
+if [ -z "${IMAGES}" ]; then
+    usage 1 "No images provided."
+fi
+
+# shellcheck disable=SC2086
+tar cf bundle.tar Manifest.json $IMAGES >/dev/null
+if [ $? -ne 0 ]; then
+    error "Creation of update bundle failed."
+    exit 1
+fi
+
+if [ "${ZIPPED}" -eq 1 ]; then
+    info "Compressing update bundle ..."
+    gzip --keep --force bundle.tar
+fi
+
+if [ "${CLEANUP}" -eq 1 ]; then
+    info "Removing temporary files ..."
+    rm bundle.tar Manifest.json
+fi
+
+if [ "${ZIPPED}" -eq 1 ]; then
+    echo "Update-package 'bundle.tar.gz' is ready now"
+else
+    echo "Update-package 'bundle.tar' is ready now"
+fi

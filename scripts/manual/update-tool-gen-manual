@@ -1,0 +1,60 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+
+SCRIPT_NAME=$(basename "$0")
+SCRIPT_PATH=$(dirname "$0")
+
+ARCH="$(uname -m)-unknown-linux-gnu"
+
+WORK_DIR="$(pwd)"
+MANUAL_FILE="${WORK_DIR}/manual.txt"
+
+error() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+warn() {
+    echo "Warning: $*" >&2
+}
+
+usage() {
+    cat << EOF
+Usage:
+    ${SCRIPT_NAME} [--GLOBAL-OPTIONS]
+
+    Global Options:
+    --help, -h              Help.
+
+    This script will generate a manual for the update-tool by iteratively
+    executing the subcommands with --help.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    opt="$1"; shift
+
+    case "$opt" in
+        -h|--help)      usage; exit 0 ;;
+    -*)             error "Unrecognized argument ${opt}." ;;
+    *)              error "Got unexpected positional argument: '%s'\n" "${opt}" ;;
+    esac
+done
+
+UPDATE_BINARY="${SCRIPT_PATH}/../../target/release/rupdate"
+if ! [ -e "${UPDATE_BINARY}" ] && ! [ -b "${UPDATE_BINARY}" ]; then
+    UPDATE_BINARY="${SCRIPT_PATH}/../../target/${ARCH}/release/rupdate"
+    if ! [ -e "${UPDATE_BINARY}" ] && ! [ -b "${UPDATE_BINARY}" ]; then
+        error "Invalid or missing update executable."
+    fi
+fi
+
+${UPDATE_BINARY} --help > "${MANUAL_FILE}"
+${UPDATE_BINARY} --help | grep -Pzo "Commands:\s*\n(.*\n)*Options:" | tail -n +2 | while read line; do
+    command="$(echo "${line}" | cut -d' ' -f1)"
+    if [ -n "${line}" ] && [ "${command}" != 'help' ]; then
+        ${UPDATE_BINARY} ${command} --help >> "${MANUAL_FILE}"
+    fi
+done
+
+printf "The manual has been generated and placed in '%s'.\n" "${MANUAL_FILE}"

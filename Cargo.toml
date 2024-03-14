@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT
+[workspace]
+members = ["core", "rupdate", "partcfgimg", "updenvimg", "testing"]
+
+[profile.release]
+# Disable debug information.
+debug = false
+
+# Strip symbols from the binary
+strip = true
+
+# Enable link time optimization (LTO) to remove dead code
+lto = true
+
+# Improve size optimization over build time
+codegen-units = 1
+
+# Remove the unwinding code from the release binary (causes an issue in Yocto)
+# panic = "abort"
+
+# Disable debug assertions.
+debug-assertions = false
+
+# Disable overflow checks.
+overflow-checks = false
+
+# Disable rpath.
+rpath = false

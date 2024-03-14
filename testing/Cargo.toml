@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "rupdate_testing"
+version = "0.1.2"
+rust-version = "1.61.0"
+edition = "2021"
+description = "Testing libraries of the update concept"
+repository = "gitlabintern.emlix.com:elektrobit/base-os/rupdate.git"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = { version = "~1.0", default-features = false }
+tempfile = { version = "~3.6", default-features = false }
+# NOTE: Clap pulls a lot additional dependencies for the derive feature
+clap = { version = "~4.0", features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+], default-features = false }

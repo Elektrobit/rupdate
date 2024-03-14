@@ -1,0 +1,322 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+
+set -e
+
+SCRIPT_NAME=$(basename "${0}")
+SCRIPT_PATH=$(dirname "$0")
+
+CREATE_BUNDLE_SCRIPT_PATH="${UPDATE_TOOL_CREATE_BUNDLE:-${SCRIPT_PATH:-.}/update-tool-create-bundle}"
+
+SCRIPT_VERSION="0.1"
+SCRIPT_USAGE=$(cat <<EOF
+Usage: ${SCRIPT_NAME} [-hvro:cp:] --partition-config <config_json> <image>
+
+Extracts all A partitions of the given image into separate partition images,
+which will then be passed to the update-tool-create-bundle tool. If update-
+tool-create-bundle is renamed or moved, the path can be set using the
+UPDATE_TOOL_CREATE_BUNDLE environment variable.
+
+-h|--help:
+    Displays this help.
+--version:
+    Displays the current version of this script.
+-v|--verbose:
+    Display additional information.
+-r|--allow-rollback:
+    Whether or not a rollback to an older system is allowed.
+-o|--output:
+    Sets the output directory for the extracted partition images.
+-z|--zipped:
+    Zip the resulting update bundle.
+-c|--cleanup
+    Removes all extracted images after creating the update bundle.
+-p|--partition-config
+    Path to the corresponding partition configuration file. If not provided, the
+    config is assumed to be present in the current directory with the name
+    partitions.json.
+
+The input image is placed after the named input arguments. The partition sets
+are taken from the provided partition configuration. In order to extract the
+partition scheme from the provided image, this script has to be executed with
+root privilegues.
+EOF
+)
+
+PARTITION_CONFIG_PATH="$(pwd)/partitions.json"
+VERBOSE_INFO=0
+
+error() {
+    echo "Error: $*" 1>&2
+}
+
+info() {
+    if [ ${VERBOSE_INFO} -ne 0 ]; then
+        echo "Info: $*"
+    fi
+}
+
+usage() {
+    rc=0
+
+    if [ -n "${1}" ]; then
+        rc="${1}"
+    fi
+
+    if [ -n "${2}" ]; then
+        error "${2}"
+    fi
+
+    echo "${SCRIPT_USAGE}"
+
+    exit "${rc}"
+}
+
+absolute_path() {
+    cd "$(dirname "${1}")"
+    case $(basename "${1}") in
+        ..) dirname "$(pwd)";;
+        .)  pwd;;
+        *)  echo "$(pwd)/$(basename "${1}")";;
+    esac
+}
+
+has_value() {
+    if [ -n "${1}" ] && ! case "${1}" in -*) true;; *) false;; esac; then
+        return 0
+    fi
+
+    return 1
+}
+
+as_list() {
+    echo "${@}" | sed 's/^[ \t]*//;s/[ \t]*$//' | tr ' ' '\n'
+}
+
+json_xpath() {
+    echo $2 | jq --raw-output "${1} // empty"
+}
+
+# Parse the command line parameters.
+while [ -n "${1+xxx}" ]; do
+    case "${1}" in
+        --help|-h)
+            usage
+            ;;
+        --version)
+            echo "${SCRIPT_NAME} v${SCRIPT_VERSION}"
+            exit 0
+            ;;
+        --verbose|-v)
+            VERBOSE_INFO=1
+            ;;
+        -r|--allow-rollback)
+            ROLLBACK=1
+            ;;
+        --output|-o)
+            if has_value "${2}"; then
+                IMG_TARGET_DIR=$(absolute_path "${2}")
+                if ! [ -d "${IMG_TARGET_DIR}" ]; then
+                    usage 1 "${IMG_TARGET_DIR} is not a directory."
+                fi
+                shift
+            else
+                usage 1 "Missing value for option ${1}."
+            fi
+
+            ;;
+        -c|--cleanup)
+            CLEANUP=1
+            ;;
+        -z|--zipped)
+            ZIPPED=1
+            ;;
+        -p|--partition-config)
+            if has_value "${2}"; then
+                PARTITION_CONFIG_PATH=$(absolute_path "${2}")
+                if ! [ -f "${PARTITION_CONFIG_PATH}" ]; then
+                    usage 1 "${PARTITION_CONFIG_PATH} is not a file."
+                fi
+                shift
+            else
+                usage 1 "Missing value for option ${1}."
+            fi
+
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            usage 1 "Unrecognized option ${1}."
+            ;;
+        *)
+            break
+            ;;
+    esac
+
+    shift
+done
+
+# Ensure this script is executed with root privilegues.
+if [ $EUID -ne 0 ]; then
+    usage 1 "Script has to be run with root privilegues to extract partition scheme from target image."
+fi
+
+# Ensure at least an image name is given.
+if [ $# -lt 1 ]; then
+    usage 1 "Invalid number of arguments."
+fi
+
+# Ensure the update configuration exists.
+if ! [ -f "${PARTITION_CONFIG_PATH}" ]; then
+    usage 1 "${PARTITION_CONFIG_PATH} is not a file."
+fi
+
+# Ensure the image exists.
+IMG_PATH="$(absolute_path "${1}")"
+if ! [ -f "${IMG_PATH}" ]; then
+    usage 1 "Error: Image ${IMG_PATH} does not exist"
+fi
+
+shift 1
+
+# Extract the partition sets from the partition config.
+info "Reading partition sets from the partition configuration ${PARTITION_CONFIG_PATH} ..."
+PARTITION_SETS=""
+PARTITION_SET_PARTS=""
+
+PART_CONFIG_JSON=$(cat "${PARTITION_CONFIG_PATH}")
+
+SET_NO=0
+while :; do
+    SET_JSON=$(json_xpath ".partition_sets[${SET_NO}]" "${PART_CONFIG_JSON}")
+    if [ -z "${SET_JSON}" ]; then
+        break
+    fi
+
+    SET_ID=$(json_xpath ".id" "${SET_JSON}")
+    if [ -z "${SET_ID}" ]; then
+        info "Partition set ${SET_NO} has no id - skipping."
+        SET_NO=$((SET_NO + 1))
+        continue
+    fi
+
+    SET_NAME=$(json_xpath ".name" "${SET_JSON}")
+    if [ -z "${SET_NAME}" ]; then
+        info "Partition set ${SET_NO} has no name - skipping."
+        SET_NO=$((SET_NO + 1))
+        continue
+    fi
+
+    PART_NO=0
+    while :; do
+        PART_JSON=$(json_xpath ".partitions[${PART_NO}]" "${SET_JSON}")
+        PART_VARIANT=$(json_xpath ".variant" "${PART_JSON}")
+        if [ -z "${PART_VARIANT}" ]; then
+            break
+        elif [ -z "${PART_VARIANT//[aA]}" ]; then
+            PART_DEVICE=$(json_xpath ".linux.device" "${PART_JSON}")
+            if [ -z "${PART_DEVICE}" ]; then
+                error "Invalid partition configuration for '${SET_NAME}'"
+                exit 1
+            fi
+
+            PART_PART=$(json_xpath ".linux.partition" "${PART_JSON}")
+            if [ -n "${PART_PART}" ]; then
+                SET_PART="${PART_DEVICE}${PART_PART}"
+            else
+                error "Invalid partition configuration for '${SET_NAME}'"
+                exit 1
+            fi
+
+            PARTITION_SETS="${PARTITION_SETS} ${SET_NAME}"
+            PARTITION_SET_PARTS="${PARTITION_SET_PARTS} ${SET_PART}"
+        fi
+
+        PART_NO=$((PART_NO + 1))
+    done
+
+    SET_NO=$((SET_NO + 1))
+done
+
+PARTITION_NUMS=$(echo "${PARTITION_SET_PARTS}" \
+    | sed -E 's/[a-zA-Z0-9\/]*@0x[0-9]*//g' \
+    | sed -E 's/[a-zA-Z0-9\/]*p([0-9]*)\b/\1/g' \
+)
+
+# Decompress the system image.
+if [[ ${IMG_PATH} == *.xz ]];then
+    info "Decompressing system image..."
+    xz --decompress --keep --stdout --threads="$(nproc)" "${IMG_PATH}" > "${IMG_PATH%%.xz}"
+    IMG_PATH="${IMG_PATH%%.xz}"
+fi
+
+if has_value "${IMG_TARGET_DIR}"; then
+    EXTR_IMG_PATH="${IMG_TARGET_DIR}/$(basename "${IMG_PATH}")"
+else
+    EXTR_IMG_PATH="${IMG_PATH}"
+fi
+
+if [ "${EXTR_IMG_PATH}" != "${IMG_PATH}" ];then
+    cp "${IMG_PATH}" "${EXTR_IMG_PATH}"
+fi
+
+EXTRACTED_IMAGES=""
+BLOCK_SIZE=$(sfdisk -d "${IMG_PATH}" \
+    | grep "sector-size" \
+    | cut -d: -f2 \
+    | xargs
+)
+
+# Extract all partitions into separate images
+info "Analyzing partitioning of $(basename "${EXTR_IMG_PATH}") ..."
+
+while IFS=' ' read -r PART_NR PART_START PART_SIZE <&3; do
+    FOUND=0
+    while read -r SET_NAME SET_PART_NO <&4; do
+        if [ ${SET_PART_NO} -eq ${PART_NR} ]; then
+            info "Found partition for ${SET_NAME}"
+            PART_NAME="${SET_NAME}"
+            FOUND=1
+            break
+        fi
+    done 4< <(paste -d' ' \
+        <(as_list "${PARTITION_SETS}") \
+        <(as_list "${PARTITION_NUMS}")
+    )
+
+    if [ ${FOUND} -eq 0 ]; then
+        continue
+    fi
+
+    # Only extract the A partitions of the image.
+    if has_value "${IMG_TARGET_DIR}"; then
+        PART_IMG_PATH="${IMG_TARGET_DIR}/${PART_NAME}.img"
+    else
+        PART_IMG_PATH="${PART_NAME}.img"
+    fi
+
+    info "Extracting partition ${PART_NR} of $(basename "${EXTR_IMG_PATH}") to $(basename "${PART_IMG_PATH}") ..."
+    info "dd if=\"${EXTR_IMG_PATH}\" of=\"${PART_IMG_PATH}\" bs=${BLOCK_SIZE} skip=${PART_START} count=$((PART_SIZE / BLOCK_SIZE))"
+    if [ $VERBOSE_INFO -eq 1 ]; then
+        dd if="${EXTR_IMG_PATH}" of="${PART_IMG_PATH}" bs=${BLOCK_SIZE} skip=${PART_START} count=$((PART_SIZE / BLOCK_SIZE))
+    else
+        dd if="${EXTR_IMG_PATH}" of="${PART_IMG_PATH}" bs=${BLOCK_SIZE} skip=${PART_START} count=$((PART_SIZE / BLOCK_SIZE)) status=none
+    fi
+
+    EXTRACTED_IMAGES="${EXTRACTED_IMAGES} ${PART_IMG_PATH}"
+done 3< <(partx -b --output=NR,START,SIZE --raw "${EXTR_IMG_PATH}" | tail -n +2)
+
+IMAGE_TUPLES=$(paste -d':' \
+    <(as_list "${PARTITION_SETS}") \
+    <(as_list "${EXTRACTED_IMAGES}") \
+)
+
+info "Generating the update bundle ..."
+echo "${CLEANUP:+"-c"} ${ROLLBACK:+"-r"} ${ZIPPED:+"-z"} ${IMAGE_TUPLES}" | xargs "${CREATE_BUNDLE_SCRIPT_PATH}"
+
+if [ -n "${CLEANUP}" ]; then
+    info "Removing extracted images .."
+    echo "${EXTRACTED_IMAGES}" | xargs rm
+fi

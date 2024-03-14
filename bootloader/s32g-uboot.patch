@@ -1,0 +1,891 @@
+diff --git a/cmd/Makefile b/cmd/Makefile
+index f1dd513a4b..adf9ededee 100644
+--- a/cmd/Makefile
++++ b/cmd/Makefile
+@@ -9,6 +9,7 @@ obj-y += boot.o
+ obj-$(CONFIG_CMD_BOOTM) += bootm.o
+ obj-y += help.o
+ obj-y += version.o
++obj-y += bootv.o
+ 
+ # command
+ obj-$(CONFIG_CMD_AES) += aes.o
+diff --git a/cmd/bootv.c b/cmd/bootv.c
+new file mode 100644
+index 0000000000..c7350ae6e5
+--- /dev/null
++++ b/cmd/bootv.c
+@@ -0,0 +1,815 @@
++#include <command.h>
++#include <common.h>
++#include <env.h>
++#include <malloc.h>
++#include <mmc.h>
++#include <u-boot/sha256.h>
++
++DECLARE_GLOBAL_DATA_PTR;
++
++#define UPDATE_ENV_MMC_DEV 0
++#define UPDATE_ENV_MMC_PART 0
++
++
++#define UPDATE_ENV_MAGIC "EBUS"
++#define UPDATE_ENV_OFFSET 0x200000
++#define UPDATE_ENV_STATE_OFFSET 0x1000
++#define UPDATE_ENV_STATE_COUNT 2
++
++#define PART_CONF_MAGIC "EBPC"
++#define PART_CONF_OFFSET 0x300000
++
++enum hashsum_type {
++    SHA256,
++};
++
++enum variant {
++    A = 0,
++    B = 1
++};
++
++enum state {
++    NORMAL,
++    INSTALLED,
++    COMMITTED,
++    TESTING,
++    REVERT,
++};
++
++struct __attribute__((__packed__)) partition_selection {
++    /* Partition set name as 36 byte ASCII string */
++    char name[36];
++    /* Active variant 'a' or 'b' */
++    uint8_t active;
++    /* Whether or not this set can be rolled back */
++    bool rollback;
++    /* Whether this partition set has been affected by an update */
++    bool affected;
++};
++
++struct __attribute__((__packed__)) update_state {
++    /* 4 byte magic identifier (ASCII encoded) */
++    char magic[4];
++    /* 4 byte version number */
++    uint32_t version;
++    /* 4 byte environment revision */
++    uint32_t revision;
++    /* 2 bytes or remaining retries */
++    int16_t remaining_tries;
++    /* 1 byte system state */
++    uint8_t state;
++    /* 8 byte number of partition selections */
++    uint64_t partsel_count;
++    /* array of n set descriptors */
++    struct partition_selection *partsel;
++    /* 4 byte of hashsum identifier */
++    uint32_t hashsum_type;
++    /* n bytes of hashsum */
++    uint8_t *hashsum;
++};
++
++struct __attribute__((__packed__)) set_descriptor {
++    /* Numeric set ID */
++    uint8_t id;
++    /* Partition set name as 36 byte ASCII string */
++    char name[36];
++};
++
++struct __attribute__((__packed__)) partition_descriptor {
++    /* 1 byte encoded variant (either A = 0x00 or B = 0x01) */
++    uint8_t variant;
++    /* Numeric partition set id */
++    uint8_t set_id;
++    /* Bootloader device id (36 byte ASCII string) */
++    char device_id[36];
++    /* Bootloader partition id (36 byte ASCII string) */
++    char partition_id[36];
++    /* Linux device id (36 byte ASCII string) */
++    char linux_device_id[36];
++    /* Linux partition id (36 byte ASCII string) */
++    char linux_partition_id[36];
++};
++
++struct __attribute__((__packed__)) partition_environment {
++    /* 4 byte magic identifier (ASCII encoded) */
++    char magic[4];
++    /* 4 byte version number */
++    uint32_t version;
++    /* 8 byte number of set descriptors */
++    uint64_t set_count;
++    /* array of n set descriptors */
++    struct set_descriptor *sets;
++    /* 8 byte number of partition descriptors */
++    uint64_t part_count;
++    /* array of n partition descriptors */
++    struct partition_descriptor *partitions;
++    /* 4 byte of hashsum identifier */
++    uint32_t hashsum_type;
++    /* n bytes of hashsum */
++    uint8_t *hashsum;
++};
++
++static inline uint32_t bytes_to_blks(struct blk_desc *desc, uint32_t size) {
++    return (size % desc->blksz) ? (size / desc->blksz) + 1 : (size / desc->blksz);
++}
++
++static inline uint32_t bytes_to_blk_offset(struct blk_desc *desc,
++                                           uint32_t offset) {
++    return offset / desc->blksz;
++}
++
++static int raw_read(struct blk_desc *desc, void *address, uint32_t offset,
++                    uint32_t size) {
++    uint32_t blk_offset = bytes_to_blk_offset(desc, offset);
++    uint32_t blk_count = bytes_to_blks(desc, size);
++
++    /* we are reading complete blocks, so we have to ensure we are having enough space */
++    void *buff = calloc(blk_count, desc->blksz);
++    if (buff == NULL) {
++        printf("bootv: Allocation of read buffer failed.\n");
++        return -ENOMEM;
++    }
++
++    unsigned long nr = blk_dread(desc, blk_offset, blk_count, buff);
++    if (nr != blk_count) {
++        printf("bootv: Reading from mmc failed.\n");
++        free(buff);
++        return -EIO;
++    }
++
++    uint32_t local_offset = offset % desc->blksz;
++    memcpy(address, buff + local_offset, size);
++    free(buff);
++
++    return 0;
++}
++
++static int raw_read_array(struct blk_desc *desc, void **dest, uint32_t offset,
++                          uint32_t count, uint32_t size) {
++    *dest = calloc(count, size);
++    if (*dest == NULL) {
++        printf("bootv: Reserving memory for partition config failed.\n");
++        return -ENOMEM;
++    }
++
++    return raw_read(desc, *dest, offset, size * count);
++}
++
++static int raw_write(struct blk_desc *desc, void *address, uint32_t offset,
++                     uint32_t size) {
++    uint32_t blk_offset = bytes_to_blk_offset(desc, offset);
++    uint32_t blk_count = bytes_to_blks(desc, size);
++
++    unsigned long nr = blk_dwrite(desc, blk_offset, blk_count, address);
++    if (nr != blk_count) {
++        printf("bootv: Writing to mmc failed.\n");
++        return -EIO;
++    }
++
++    return 0;
++}
++
++static int buffer_extend(uint8_t **buff, size_t *buff_size, void *data, uint32_t size) {
++    uint32_t new_size = *buff_size + size;
++
++    void *temp = realloc(*buff, sizeof(**buff) * new_size);
++    if (temp == NULL) {
++        printf("bootv: Failed to extend output buffer.\n");
++        return -ENOMEM;
++    }
++
++    memcpy(temp + *buff_size, data, size);
++
++    *buff = temp;
++    *buff_size = new_size;
++
++    return 0;
++}
++
++static int hashsum_read(struct blk_desc *desc, uint32_t *hashsum_type, uint8_t **hashsum, size_t offset) {
++    int res;
++    uint32_t size;
++
++    if ((res = raw_read(desc, hashsum_type, offset, sizeof(*hashsum_type))) != 0) {
++        printf("bootv: Failed to read hashsum type.\n");
++        return res;
++    }
++
++    offset += sizeof(*hashsum_type);
++
++    switch (*hashsum_type) {
++    case SHA256:
++        size = 32;
++        break;
++    default:
++        printf("bootv: unkown hashsum type %d.\n", *hashsum_type);
++        return -EINVAL;
++    }
++
++    if ((res = raw_read_array(desc, (void**) hashsum, offset, size, sizeof(uint8_t))) != 0) {
++        printf("bootv: Reading partition config hashsum failed.\n");
++    }
++
++    return res;
++}
++
++static int hashsum_write(uint8_t **buff, size_t *buff_size, uint32_t hashsum_type, uint8_t *hashsum) {
++    int res;
++    uint32_t size;
++
++    switch (hashsum_type) {
++    case SHA256:
++        size = 32;
++        break;
++    default:
++        printf("bootv: unkown hashsum type %d.\n", hashsum_type);
++        return -EINVAL;
++    }
++
++    if ((res = buffer_extend(buff, buff_size, &hashsum_type, sizeof(hashsum_type))) != 0) {
++        printf("bootv: Failed to write hashsum type.\n");
++        return res;
++    }
++
++    if ((res = buffer_extend(buff, buff_size, hashsum, size * sizeof(uint8_t))) != 0) {
++        printf("bootv: Writing hashsum failed.\n");
++    }
++
++    return res;
++}
++
++static int partenv_check_hash(struct partition_environment *part_env) {
++    sha256_context sha256_ctx;
++
++    size_t hashsum_length;
++    uint8_t *hashsum;
++
++    switch (part_env->hashsum_type) {
++    case SHA256:
++        uint8_t hash_256_output[SHA256_SUM_LEN];
++
++        sha256_starts(&sha256_ctx);
++        sha256_update(&sha256_ctx, (uint8_t *) part_env, offsetof(struct partition_environment, sets));
++        sha256_update(&sha256_ctx, (uint8_t *) part_env->sets, part_env->set_count * sizeof(*part_env->sets));
++        sha256_update(&sha256_ctx, (uint8_t *) &part_env->part_count, sizeof(part_env->part_count));
++        sha256_update(&sha256_ctx, (uint8_t *) part_env->partitions, part_env->part_count * sizeof(*part_env->partitions));
++        sha256_finish(&sha256_ctx, hash_256_output);
++
++        hashsum_length = SHA256_SUM_LEN;
++        hashsum = hash_256_output;
++        break;
++    default:
++        printf("bootv: Failed to calculate partition environment hashsum for unkown hashsum type %d.\n", part_env->hashsum_type);
++        return -EINVAL;
++    }
++
++    if (memcmp(part_env->hashsum, hashsum, hashsum_length) != 0) {
++        printf("bootv: Calculated hashsum of bootloader partition state does not match the provided one!\n");
++        return -1;
++    }
++
++    return 0;
++}
++
++static int partenv_verify(struct partition_environment *part_env) {
++    if (strncmp(part_env->magic, PART_CONF_MAGIC, 4) != 0) {
++        printf("bootv: Bootloader partition state magic invalid!\n");
++        return -1;
++    }
++
++    if (partenv_check_hash(part_env) != 0) {
++        printf("bootv: Invalid bootloader partition state hashsum!\n");
++        return -1;
++    }
++
++    return 0;
++}
++
++static int partenv_find_set(char *name, struct partition_environment *part_env,
++                            struct set_descriptor **set) {
++    struct set_descriptor *temp = NULL;
++
++    for (int i = 0; i < part_env->set_count; i++) {
++        if (strcmp(part_env->sets[i].name, name) == 0) {
++            temp = &part_env->sets[i];
++            break;
++        }
++    }
++
++    if (set == NULL) {
++        printf("bootv: Failed to find %s partition set.\n", name);
++        return -ENODEV;
++    }
++
++    *set = temp;
++
++    return 0;
++}
++
++static int partenv_find_partition(char *set_name, enum variant variant,
++                                  struct partition_environment *part_env,
++                                  struct partition_descriptor **partition) {
++    int i, res;
++    struct set_descriptor *set = NULL;
++    struct partition_descriptor *part = NULL;
++
++    if ((res = partenv_find_set(set_name, part_env, &set)) != 0) {
++        return res;
++    }
++
++    for (i = 0; i < part_env->part_count; i++) {
++        if (part_env->partitions[i].set_id == set->id && part_env->partitions[i].variant == variant) {
++            part = &part_env->partitions[i];
++            break;
++        }
++    }
++
++    if (part == NULL) {
++        printf("bootv: Failed to find %s partition.\n", set_name);
++        return -ENODEV;
++    }
++
++    *partition = part;
++
++    return 0;
++}
++
++static int partenv_read(struct blk_desc *desc,
++                        struct partition_environment *part_env) {
++    int res;
++    size_t offset = PART_CONF_OFFSET;
++
++    size_t header_size = offsetof(struct partition_environment, sets);
++    if ((res = raw_read(desc, part_env, offset, header_size)) != 0) {
++        printf("bootv: Reading partition config header failed.\n");
++        goto error;
++    }
++
++    offset += header_size;
++    if ((res = raw_read_array(desc, (void**) &part_env->sets, offset, part_env->set_count, sizeof(*part_env->sets))) != 0) {
++        printf("bootv: Failed to read partition set descriptors.\n");
++        goto error;
++    }
++
++    offset += part_env->set_count * sizeof(*part_env->sets);
++    if ((res = raw_read(desc, &part_env->part_count, offset, sizeof(part_env->part_count))) != 0) {
++        printf("bootv: Failed to read partition config parition descriptor count.\n");
++        goto set_err;
++    }
++
++    offset += sizeof(part_env->part_count);
++    if ((res = raw_read_array(desc, (void**) &part_env->partitions, offset, part_env->part_count, sizeof(*part_env->partitions))) != 0) {
++        printf("bootv: Failed to read partition descriptors.\n");
++        goto set_err;
++    }
++
++    offset += part_env->part_count * sizeof(*part_env->partitions);
++    if ((res = hashsum_read(desc, &part_env->hashsum_type, &part_env->hashsum, offset)) != 0) {
++        printf("bootv: Failed to read partition config hashsum.\n");
++        goto part_err;
++    }
++
++    if (partenv_verify(part_env) != 0) {
++        printf("bootv: Verification of partition configuration failed.\n");
++        res = -1;
++        goto part_err;
++    }
++
++    return 0;
++
++part_err:
++    free(part_env->partitions);
++
++set_err:
++    free(part_env->sets);
++
++error:
++    return res;
++}
++
++static int update_state_hash(struct update_state *state, bool check) {
++    sha256_context sha256_ctx;
++
++    size_t hashsum_length;
++    uint8_t *hashsum;
++
++    switch (state->hashsum_type) {
++    case SHA256:
++        uint8_t hash_256_output[SHA256_SUM_LEN];
++
++        sha256_starts(&sha256_ctx);
++        sha256_update(&sha256_ctx, (uint8_t *) state, offsetof(struct update_state, partsel));
++        sha256_update(&sha256_ctx, (uint8_t *) state->partsel, state->partsel_count * sizeof(*state->partsel));
++        sha256_finish(&sha256_ctx, hash_256_output);
++
++        hashsum = hash_256_output;
++        hashsum_length = SHA256_SUM_LEN;
++        break;
++    default:
++        printf("bootv: Failed to calculate update state hashsum for unkown hashsum type %d.\n", state->hashsum_type);
++        return -EINVAL;
++    }
++
++    if (check && memcmp(state->hashsum, hashsum, hashsum_length) != 0) {
++        printf("bootv: Calculated hashsum of update state does not match the provided one!\n");
++        return -1;
++    } else if (!check) {
++        if (state->hashsum != NULL) {
++            free(state->hashsum);
++        }
++
++        state->hashsum = calloc(hashsum_length, sizeof(*hashsum));
++        if (state->hashsum == NULL) {
++            printf("bootv: Allocation of hashsum buffer failed.\n");
++            return -ENOMEM;
++        }
++
++        memcpy(state->hashsum, hashsum, hashsum_length);
++    }
++
++    return 0;
++}
++
++static int update_state_verify(struct update_state *state) {
++    if (strncmp(state->magic, UPDATE_ENV_MAGIC, 4) != 0) {
++        printf("bootv: System environment state magic invalid!\n");
++        return -1;
++    }
++
++    if (update_state_hash(state, true) != 0) {
++        printf("bootv: Invalid update state hashsum!\n");
++        return -1;
++    }
++
++    return 0;
++}
++
++static int update_state_find_partsel(char *name, struct update_state *state,
++                                     struct partition_selection **set) {
++    struct partition_selection *temp = NULL;
++
++    for (int i = 0; i < state->partsel_count; i++) {
++        if (strcmp(state->partsel[i].name, name) == 0) {
++            temp = &state->partsel[i];
++            break;
++        }
++    }
++
++    if (set == NULL) {
++        printf("bootv: Failed to find %s partition selection.\n", name);
++        return -ENODEV;
++    }
++
++    *set = temp;
++
++    return 0;
++}
++
++static int update_state_read(struct blk_desc *desc, struct update_state *state, int idx) {
++    int res;
++    size_t offset = UPDATE_ENV_OFFSET + (idx * UPDATE_ENV_STATE_OFFSET);
++
++    size_t header_size = offsetof(struct update_state, partsel);
++    if ((res = raw_read(desc, state, offset, header_size)) != 0) {
++        printf("bootv: Reading update state header failed.\n");
++        goto error;
++    }
++
++    offset += header_size;
++    if ((res = raw_read_array(desc, (void**) &state->partsel, offset, state->partsel_count, sizeof(*state->partsel))) != 0) {
++        printf("bootv: Failed to read partition selection.\n");
++        goto error;
++    }
++
++    offset += state->partsel_count * sizeof(*state->partsel);
++    if ((res = hashsum_read(desc, &state->hashsum_type, &state->hashsum, offset)) != 0) {
++        printf("bootv: Failed to read update state hashsum.\n");
++        goto partsel_error;
++    }
++
++    if ((res = update_state_verify(state)) != 0) {
++        printf("bootv: Verification of update state failed.\n");
++        goto partsel_error;
++    }
++
++    return 0;
++
++partsel_error:
++    free(state->partsel);
++
++error:
++    return res;
++}
++
++static int update_state_write(struct blk_desc *desc, struct update_state *state, int idx) {
++    int res;
++    uint8_t *buff = NULL;
++    size_t buff_size = 0;
++    size_t offset = UPDATE_ENV_OFFSET + (idx * UPDATE_ENV_STATE_OFFSET);
++
++    /* The latest state is detected by the highest environment revision */
++    state->revision++;
++
++    /* Do not hash clean states */
++    if (strncmp(state->magic, UPDATE_ENV_MAGIC, 4) == 0) {
++        if ((res = update_state_hash(state, false)) != 0) {
++            printf("bootv: Updating update state hashsum failed!\n");
++            goto error;
++        }
++    }
++
++    size_t header_size = offsetof(struct update_state, partsel);
++    if ((res = buffer_extend(&buff, &buff_size, state, header_size)) != 0) {
++        printf("bootv: Writing update state header failed.\n");
++        goto error;
++    }
++
++    if ((res = buffer_extend(&buff, &buff_size, state->partsel, state->partsel_count * sizeof(*state->partsel))) != 0) {
++        printf("bootv: Failed to write partition selection.\n");
++        goto header_error;
++    }
++
++    if ((res = hashsum_write(&buff, &buff_size, state->hashsum_type, state->hashsum)) != 0) {
++        printf("bootv: Failed to write update state hashsum.\n");
++        goto header_error;
++    }
++
++    if ((res = raw_write(desc, buff, offset, buff_size)) != 0) {
++        printf("bootv: Failed to write update state to disc.\n");
++    }
++
++header_error:
++    free(buff);
++
++error:
++    return res;
++}
++
++static ssize_t cmdline_append_arg(char const *cmdline, const char *arg,
++                                  char **new_cmdline) {
++    int err;
++    char *tmp_cmdline = NULL, *haystack;
++    ssize_t new_length = strlen(cmdline) + strlen(arg) + 1;
++
++    if ((haystack = strstr(cmdline, "--")) != NULL) {
++        tmp_cmdline = malloc(sizeof(*tmp_cmdline) * (new_length + 1));
++        if (tmp_cmdline != NULL) {
++            err = snprintf(tmp_cmdline, new_length + 1, "%s %s", cmdline, arg);
++        }
++    } else {
++        new_length += 4;
++        tmp_cmdline = malloc(sizeof(*tmp_cmdline) * (new_length + 1));
++        if (tmp_cmdline != NULL) {
++            err = snprintf(tmp_cmdline, new_length + 1, "%s -- %s", cmdline, arg);
++        }
++    }
++
++    if (tmp_cmdline != NULL && err >= 0 && err < (new_length + 1)) {
++        *new_cmdline = tmp_cmdline;
++    } else {
++        new_length = -1;
++    }
++
++    return new_length;
++}
++
++static ssize_t boot_cmdline(struct blk_desc *desc,
++                            struct update_state *state,
++                            struct partition_environment *part_env) {
++    int res;
++    struct set_descriptor *rootfs_set = NULL;
++    struct partition_descriptor *rootfs = NULL;
++    struct partition_selection *rootfs_partsel = NULL;
++    char *dev_name, *new_cmdline;
++    ssize_t new_length = -1;
++
++    char *cmdline = env_get("bootargs");
++    if (cmdline == NULL) {
++        cmdline = "";
++    }
++
++    if ((res = partenv_find_set("rootfs", part_env, &rootfs_set)) != 0) {
++        printf("bootv: Failed to find rootfs partition set.\n");
++        return -ENODEV;
++    }
++
++    if ((res = update_state_find_partsel("rootfs", state, &rootfs_partsel)) != 0) {
++        printf("bootv: Failed to find partition selection for rootfs.\n");
++        return -ENODEV;
++    }
++
++    if ((res = partenv_find_partition("rootfs", rootfs_partsel->active, part_env, &rootfs)) != 0) {
++        printf("bootv: Failed to find rootfs partition.\n");
++        return -ENODEV;
++    }
++
++    res = snprintf(NULL, 0, "/dev/%s%s", rootfs->linux_device_id, rootfs->linux_partition_id);
++    if (res < 0) {
++        printf("bootv: Failed to get the length of rootfs partition name.\n");
++        return -EINVAL;
++    }
++
++    dev_name = calloc(res + 1, sizeof(*dev_name));
++    if (dev_name == NULL) {
++        printf("bootv: Failed to allocate memory for rootfs partition name.\n");
++        return -ENOMEM;
++    }
++
++    res = snprintf(dev_name, res + 1, "/dev/%s%s", rootfs->linux_device_id, rootfs->linux_partition_id);
++    if (res < 0) {
++        printf("bootv: Failed to get rootfs partition name.\n");
++        free(dev_name);
++        return -ENOMEM;
++    }
++
++    printf("bootv: Configuring root partition to be \"%s\".\n", dev_name);
++    new_length = cmdline_append_arg(cmdline, dev_name, &new_cmdline);
++    if (new_length >= 0) {
++        res = env_set("bootargs", new_cmdline);
++        if (res == 0) {
++            printf("bootv: Kernel command line: \"%s\"\n", new_cmdline);
++        } else {
++            printf("bootv: Failed to append rootfs partition to kernel commandline.\n");
++        }
++
++        free(new_cmdline);
++    }
++
++    free(dev_name);
++
++    return new_length;
++}
++
++static int update_state_boot(struct blk_desc *desc, struct update_state *state,
++                             struct partition_environment *part_env,
++                             char *const argv[]) {
++    const char *cmd;
++    struct set_descriptor *bootfs = NULL;
++    struct partition_selection *bootfs_partsel = NULL;
++
++    ssize_t res = boot_cmdline(desc, state, part_env);
++    if (res >= 0) {
++        if ((res = partenv_find_set("bootfs", part_env, &bootfs)) != 0) {
++            printf("bootv: Failed to find bootfs partition set.\n");
++            return -ENODEV;
++        }
++
++        if ((res = update_state_find_partsel("bootfs", state, &bootfs_partsel)) != 0) {
++            printf("bootv: Failed to find partition selection for bootfs.\n");
++            return -ENODEV;
++        }
++
++        switch (bootfs_partsel->active) {
++            case A:
++                cmd = env_get(argv[1]);
++                break;
++            case B:
++                cmd = env_get(argv[2]);
++                break;
++            default:
++                printf("bootv: Invalid bootfs partition selection.\n");
++                return -1;
++        }
++
++        if (cmd) {
++            res = run_command(cmd, 0);
++        } else {
++            return -1;
++        }
++    }
++
++    return res;
++}
++
++static int update_handle_state(struct blk_desc *desc, struct partition_environment *part_env, char *const argv[]) {
++    int res1, res2, next_slot;
++    struct update_state state1 = {0}, state2 = {0}, *current;
++
++    if ((res1 = update_state_read(desc, &state1, 0)) == 0) {
++        printf("bootv: Found valid update state in the first environment slot!\n");
++    }
++
++    if ((res2 = update_state_read(desc, &state2, 1)) == 0) {
++        printf("bootv: Found valid update state in the second environment slot!\n");
++    }
++
++    if (res1 == 0 && res2 == 0) { /* Two valid states */
++        if (state1.revision > state2.revision) {
++            current = &state1;
++            next_slot = 1;
++        } else {
++            current = &state2;
++            next_slot = 0;
++        }
++    } else if (res1 == 0) { /* Only update state of slot 1 is valid */
++        current = &state1;
++        next_slot = 1;
++    } else if (res2 == 0) { /* Only update state of slot 2 is valid */
++        current = &state2;
++        next_slot = 0;
++    } else { /* No valid states found */
++        printf("bootv: No valid update state found.\n");
++        return -1;
++    }
++
++    switch (current->state) {
++        case NORMAL:
++            /* Nothing to do here, go ahead and boot */
++            printf("bootv: Normal state - boot active patrtition set.\n");
++            break;
++        case INSTALLED:
++            printf("bootv: New update installed, but not committed for testing.\n");
++            printf("bootv: Booting old system.\n");
++            break;
++        case COMMITTED:
++            printf("bootv: New system committed, entering testing stage.\n");
++            current->state = TESTING;
++            for (struct partition_selection *partsel = current->partsel;
++                    partsel < current->partsel + current->partsel_count;
++                    partsel++) {
++                if (partsel->affected) {
++                    partsel->active = (partsel->active == A) ? B : A;
++                }
++            }
++            update_state_write(desc, current, next_slot);
++            break;
++        case TESTING:
++            /* fall through */
++        case REVERT:
++            current->remaining_tries--;
++            if (current->remaining_tries <= 0 || current->state == REVERT) {
++                printf("bootv: Moving back to previous installation.\n");
++                current->state = NORMAL;
++                current->remaining_tries = -1;
++                for (struct partition_selection *partsel = current->partsel;
++                        partsel < current->partsel + current->partsel_count;
++                        partsel++) {
++                    if (partsel->affected) {
++                        partsel->active = (partsel->active == A) ? B : A;
++                        partsel->affected = false;
++                    }
++
++                    partsel->rollback = false;
++                }
++            }
++
++            update_state_write(desc, current, next_slot);
++            break;
++        default:
++            printf("bootv: Invalid update state (%d).\n", current->state);
++            return -1;
++    }
++
++    return update_state_boot(desc, current, part_env, argv);
++}
++
++int do_boot_verified(cmd_tbl_t *cmdtp, int flag, int argc, char *const argv[]) {
++    struct partition_environment part_env = {0};
++    struct blk_desc *desc;
++    struct udevice *dev;
++    struct mmc *mmc;
++    int res;
++
++    if (argc < 3) {
++        printf("Error: Missing boot command variable\n"
++            "Usage: %s BOOT_SYSTEM_A_VARIABLE BOOT_SYSTEM_B_VARIABLE\n",
++            argv[0]);
++        return -1;
++    }
++
++    mmc_initialize(NULL);
++
++    mmc = find_mmc_device(UPDATE_ENV_MMC_DEV);
++    if (!mmc) {
++        printf("bootv: Can't find MMC device!\n");
++        return -ENODEV;
++    }
++
++    if (blk_get_from_parent(mmc->dev, &dev)) {
++        printf("bootv: No MMC block device.\n");
++        return -ENODEV;
++    }
++
++    if (blk_select_hwpart_devnum(IF_TYPE_MMC, UPDATE_ENV_MMC_DEV,
++                                UPDATE_ENV_MMC_PART)) {
++        printf("bootv: MMC partition switch failed.\n");
++        return -ENODEV;
++    }
++
++    desc = mmc_get_blk_desc(mmc);
++
++    if ((res = partenv_read(desc, &part_env)) != 0) {
++        printf("bootv: Failed to read partition configuration.\n");
++        return res;
++    }
++
++    update_handle_state(desc, &part_env, argv);
++
++    return CMD_RET_FAILURE;
++}
++
++U_BOOT_CMD(bootv, CONFIG_SYS_MAXARGS, 0, do_boot_verified,
++        "boot verified system using boot specified environment variable",
++        "BOOT_SYSTEM_A_VARIABLE BOOT_SYSTEM_B_VARIABLE\n"
++        "    - execute one of the two given environment variables\n"
++        "      containing the boot steps for set A or B variant");
+diff --git a/configs/s32g274ardb2_defconfig b/configs/s32g274ardb2_defconfig
+index 3270ada808..2c220b3081 100644
+--- a/configs/s32g274ardb2_defconfig
++++ b/configs/s32g274ardb2_defconfig
+@@ -22,6 +22,7 @@ CONFIG_CMD_CLK=y
+ CONFIG_CMD_DM=y
+ CONFIG_CMD_I2C=y
+ CONFIG_CMD_MMC=y
++CONFIG_MMC_WRITE=y
+ CONFIG_CMD_PCI=y
+ CONFIG_CMD_SPI=y
+ CONFIG_CMD_PMIC=y
+diff --git a/include/configs/s32.h b/include/configs/s32.h
+index 3e4a93c959..bcfda8d1d2 100644
+--- a/include/configs/s32.h
++++ b/include/configs/s32.h
+@@ -254,6 +254,7 @@
+ #define CONFIG_HWCONFIG
+ 
+ #define IMAGE_NAME boot.itb
++#define IMAGE_NAME_ALT bootargs.itb
+ #define BOOT_MTD bootm
+ 
+ #ifndef CONFIG_BOARD_EXTRA_ENV_SETTINGS
+@@ -389,6 +390,7 @@
+ 	"script=boot.scr\0" \
+ 	"boot_mtd=" __stringify(BOOT_MTD) "\0" \
+ 	"image=" __stringify(IMAGE_NAME) "\0" \
++	"image_alt=" __stringify(IMAGE_NAME_ALT) "\0" \
+ 	"ramdisk=" __stringify(RAMDISK_NAME) "\0"\
+ 	"console=ttyLF" __stringify(CONFIG_FSL_LINFLEX_MODULE) "\0" \
+ 	"fdt_high=0xa0000000\0" \
+@@ -437,12 +439,22 @@
+ 	"jtagsdboot=echo Booting loading Linux with ramdisk from SD...; " \
+ 		"run loadimage; run loadramdisk; run loadfdt;"\
+ 		"${boot_mtd} ${loadaddr} ${ramdisk_addr} ${fdt_addr}\0" \
+-	"mmcboot=echo Booting from mmc ...; " \
++	"mmcboot=run mmcargs; " \
++		"bootv mmcboot_kernel_a mmcboot_kernel_b\0" \
++	"mmcboot_kernel_a=echo Booting Kernel A; " \
++		"setenv mmcpart 1; " \
++		"run do_mmcboot\0" \
++	"mmcboot_kernel_b=echo Booting Kernel B; " \
++		"setenv mmcpart 2; " \
++		"run do_mmcboot\0" \
++	"do_mmcboot=echo Booting from mmc ...; " \
+ 		PFE_INIT_CMD \
+-		"run mmcargs; " \
+ 		"mmc dev ${mmcdev}; mmc rescan; " \
+ 		"echo Booting Linux from SD/eMMC...; " \
+-		"fatload mmc ${mmcdev}:${mmcpart} ${loadaddr} ${image}; " \
++		"if fatload mmc ${mmcdev}:${mmcpart} ${loadaddr} ${image}; then ; else " \
++			"fatload mmc ${mmcdev}:${mmcpart} ${loadaddr} ${image_alt}; " \
++			"setenv bootargs; " \
++		"fi; " \
+ 		"${boot_mtd}\0" \
+ 	"netargs=setenv bootargs console=${console},${baudrate} " \
+ 		"root=/dev/nfs " \

@@ -1,0 +1,75 @@
+{
+    "version": "0.1.0",
+    "hash_algorithm": "sha256",
+    "partition_sets": [
+        {
+            "name": "update_env",
+            "filesystem": "update_fs",
+            "comment": "Shared update environment",
+            "partitions": [
+                {
+                    "linux": {
+                        "device": "mmcblk0",
+                        "offset": "0"
+                    },
+                    "bootloader": {
+                        "device": "0",
+                        "offset": "0"
+                    }
+                }
+            ]
+        },
+        {
+            "id": 0,
+            "name": "bootfs",
+            "filesystem": "ext2",
+            "mountpoint": "/boot",
+            "partitions": [
+                {
+                    "variant": "A",
+                    "linux": {
+                        "device": "null",
+                        "partition": ""
+                    },
+                    "bootloader": {
+                        "device": "0",
+                        "partition": "2"
+                    }
+                },
+                {
+                    "variant": "B",
+                    "linux": {
+                        "device": "null",
+                        "partition": ""
+                    },
+                    "bootloader": {
+                        "device": "0",
+                        "partition": "3"
+                    }
+                }
+            ]
+        },
+        {
+            "id": 1,
+            "name": "rootfs",
+            "filesystem": "squashfs",
+            "mountpoint": "/",
+            "partitions": [
+                {
+                    "variant": "A",
+                    "linux": {
+                        "device": "null",
+                        "partition": ""
+                    }
+                },
+                {
+                    "variant": "B",
+                    "linux": {
+                        "device": "null",
+                        "partition": ""
+                    }
+                }
+            ]
+        }
+    ]
+}

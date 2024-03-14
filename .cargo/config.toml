@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: MIT
+
+# Cargo uses libgit2, which causes issues while building for aarch64 targets:
+# https://github.com/rust-lang/cargo/issues/10583
+#
+# As this is one of many errors caused by libgit2, it is adviced to use the local git binary:
+# https://docs.shipyard.rs/configuration/git-fetch-with-cli.html
+[net]
+git-fetch-with-cli = true

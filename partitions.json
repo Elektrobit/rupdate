@@ -1,0 +1,125 @@
+{
+    "version": "0.1.0",
+    "hash_algorithm": "sha256",
+    "partition_sets": [
+        {
+            "name": "part_conf_env",
+            "filesystem": "part_conf_fs",
+            "comment": "Bootloader accessible partition layout",
+            "partitions": [
+                {
+                    "linux": {
+                        "device": "mmcblk0",
+                        "offset": "0x300000"
+                    },
+                    "bootloader": {
+                        "device": "0",
+                        "offset": "0x300000"
+                    }
+                }
+            ]
+        },
+        {
+            "name": "update_env",
+            "filesystem": "update_fs",
+            "comment": "Shared update environment",
+            "user_data": {
+                "blob_offset": "0x1000"
+            },
+            "partitions": [
+                {
+                    "linux": {
+                        "device": "mmcblk0",
+                        "offset": "0x200000"
+                    },
+                    "bootloader": {
+                        "device": "0",
+                        "offset": "0x200000"
+                    }
+                }
+            ]
+        },
+        {
+            "name": "uboot",
+            "filesystem": "fat32",
+            "comment": "Raspberry Pi specific bootloader partition",
+            "partitions": [
+                {
+                    "linux": {
+                        "device": "mmcblk0",
+                        "partition": "p1"
+                    },
+                    "bootloader": {
+                        "device": "0",
+                        "partition": "1"
+                    }
+                }
+            ]
+        },
+        {
+            "id": 0,
+            "name": "bootfs",
+            "filesystem": "ext2",
+            "mountpoint": "/boot",
+            "partitions": [
+                {
+                    "variant": "A",
+                    "linux": {
+                        "device": "mmcblk0",
+                        "partition": "p2"
+                    },
+                    "bootloader": {
+                        "device": "0",
+                        "partition": "2"
+                    }
+                },
+                {
+                    "variant": "B",
+                    "linux": {
+                        "device": "mmcblk0",
+                        "partition": "p3"
+                    },
+                    "bootloader": {
+                        "device": "0",
+                        "partition": "3"
+                    }
+                }
+            ]
+        },
+        {
+            "name": "home",
+            "filesystem": "ext2",
+            "mountpoint": "/home",
+            "partitions": [
+                {
+                    "linux": {
+                        "device": "mmcblk0",
+                        "partition": "p5"
+                    }
+                }
+            ]
+        },
+        {
+            "id": 1,
+            "name": "rootfs",
+            "filesystem": "squashfs",
+            "mountpoint": "/",
+            "partitions": [
+                {
+                    "variant": "A",
+                    "linux": {
+                        "device": "mmcblk0",
+                        "partition": "p6"
+                    }
+                },
+                {
+                    "variant": "B",
+                    "linux": {
+                        "device": "mmcblk0",
+                        "partition": "p7"
+                    }
+                }
+            ]
+        }
+    ]
+}
