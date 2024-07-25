@@ -208,7 +208,7 @@ bootldr -> os : pass control
 
 ### How to boot
 
-To correctly boot a system have these [patches](bootloaders/) added to your bootloader.
+To correctly boot a system have these [patches](bootloader/) added to your bootloader.
 
 Or implement feature as described in this [requirements](bootloader/requirements_to_bootloader.md).
 
